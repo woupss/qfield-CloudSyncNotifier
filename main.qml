@@ -35,6 +35,10 @@ Item {
         "❌ Erreur de connexion : réponse illisible.": "❌ Connection error: unreadable response.",
         "❌ Echec de connexion (": "❌ Login failed (",
         ") : identifiant ou mot de passe incorrect ?": "): incorrect username or password?",
+        "❌ Impossible de joindre le serveur. Vérifiez votre connexion internet.": "❌ Cannot reach the server. Check your internet connection.",
+        "⚠️ Session expirée. Veuillez vous reconnecter.": "⚠️ Session expired. Please log in again.",
+        "❌ Impossible de vérifier votre session : pas de connexion au serveur.": "❌ Cannot verify your session: no connection to the server.",
+        "⏱️ La synchronisation a expiré. Vérifiez votre connexion et réessayez.": "⏱️ Synchronization timed out. Check your connection and try again.",
         "🔼 Masquer": "🔼 Hide",
         "🔽 Voir utilisateur / serveur": "🔼 Show user / server",
         "Serveur : ": "Server: ",
@@ -207,9 +211,14 @@ Item {
     function performLogin(username, password, callback) {
         var xhr = new XMLHttpRequest();
         xhr.open("POST", credsPersist.cloudServer + "/auth/login/");
+        xhr.timeout = 15000;
         xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
         xhr.onreadystatechange = function() {
             if (xhr.readyState === XMLHttpRequest.DONE) {
+                if (xhr.status === 0) {
+                    callback(false, tr("❌ Impossible de joindre le serveur. Vérifiez votre connexion internet."));
+                    return;
+                }
                 if (xhr.status >= 200 && xhr.status < 300) {
                     try {
                         var resp = JSON.parse(xhr.responseText);
@@ -233,7 +242,40 @@ Item {
                 }
             }
         };
+        xhr.ontimeout = function() {
+            callback(false, tr("❌ Impossible de joindre le serveur. Vérifiez votre connexion internet."));
+        };
+        xhr.onerror = function() {
+            callback(false, tr("❌ Impossible de joindre le serveur. Vérifiez votre connexion internet."));
+        };
         xhr.send("username=" + encodeURIComponent(username) + "&password=" + encodeURIComponent(password));
+    }
+
+    // ============================================
+    //   VÉRIFICATION DE VALIDITÉ DU TOKEN
+    // ============================================
+
+    // NOTE: adapte l'en-tête "Authorization" ci-dessous si CloudSync.qml
+    // (appels REST orphelins) utilise un format différent sur ton instance.
+    function verifyTokenValid(callback) {
+        var token = getEffectiveToken();
+        if (!token) { callback("no_token"); return; }
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", credsPersist.cloudServer + "/projects/");
+        xhr.timeout = 10000;
+        xhr.setRequestHeader("Authorization", "Token " + token);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState === XMLHttpRequest.DONE) {
+                if (xhr.status === 0) { callback("network_error"); return; }
+                if (xhr.status === 401 || xhr.status === 403) { callback("invalid_token"); return; }
+                if (xhr.status >= 200 && xhr.status < 300) { callback("ok"); return; }
+                // Statut inattendu (5xx, etc.) : on ne bloque pas, on laisse QField gérer la sync
+                callback("ok");
+            }
+        };
+        xhr.ontimeout = function() { callback("network_error"); };
+        xhr.onerror = function() { callback("network_error"); };
+        xhr.send();
     }
 
     property var _pendingContinuation: null
@@ -244,11 +286,13 @@ Item {
         _pendingContinuation = onReady;
         loginErrorLabel.text = "";
         loginPasswordField.text = "";
+        _showPassword = false;
         loginDialog.open();
     }
 
     property bool _loginBusy: false
     property bool _showServerOverride: false
+    property bool _showPassword: false
 
     function attemptLogin() {
         var username = getEffectiveUsername();
@@ -351,6 +395,24 @@ Item {
         }
     }
 
+    Timer {
+        id: syncWatchdog
+        interval: 45000
+        repeat: false
+        running: _syncBusy
+        onTriggered: {
+            finishSyncAction()
+            verifyTokenValid(function(result) {
+                if (result === "invalid_token" || result === "no_token") {
+                    setEffectiveToken("")
+                    showSyncError(tr("⚠️ Session expirée. Veuillez vous reconnecter."))
+                } else {
+                    showSyncError(tr("⏱️ La synchronisation a expiré. Vérifiez votre connexion et réessayez."))
+                }
+            })
+        }
+    }
+
     function finishSyncAction() {
         _syncBusy = false
         if (syncProgressDialog.opened) syncProgressDialog.close()
@@ -413,8 +475,23 @@ Item {
         if (cloudInfo.error) { beginNativeSync(); return; }
         resolveKnownServerForProject(cloudInfo);
         ensureAuthenticated(function() {
-            beginNativeSync();
+            verifyTokenValid(function(result) {
+                if (result === "ok") {
+                    beginNativeSync();
+                } else if (result === "invalid_token" || result === "no_token") {
+                    setEffectiveToken("");
+                    showSyncError(tr("⚠️ Session expirée. Veuillez vous reconnecter."));
+                    ensureAuthenticated(function() { beginNativeSync(); });
+                } else {
+                    showSyncError(tr("❌ Impossible de vérifier votre session : pas de connexion au serveur."));
+                }
+            });
         });
+    }
+
+    function showSyncError(msg) {
+        syncErrorDialog.message = msg;
+        syncErrorDialog.open();
     }
 
     // ============================================
@@ -582,14 +659,24 @@ Item {
                 placeholderText: tr("Identifiant QFieldCloud")
                 font.pixelSize: 13
             }
-            TextField {
-                id: loginPasswordField
+            RowLayout {
                 Layout.fillWidth: true
                 visible: !_loginBusy
-                placeholderText: tr("Mot de passe")
-                echoMode: TextInput.Password
-                font.pixelSize: 13
-                onAccepted: attemptLogin()
+                spacing: 6
+                TextField {
+                    id: loginPasswordField
+                    Layout.fillWidth: true
+                    placeholderText: tr("Mot de passe")
+                    echoMode: _showPassword ? TextInput.Normal : TextInput.Password
+                    font.pixelSize: 13
+                    onAccepted: attemptLogin()
+                }
+                Text {
+                    text: _showPassword ? "🔒" : "👁"
+                    font.pixelSize: 20
+                    Layout.alignment: Qt.AlignVCenter
+                    MouseArea { anchors.fill: parent; anchors.margins: -6; onClicked: _showPassword = !_showPassword }
+                }
             }
             Label {
                 id: loginErrorLabel
@@ -601,7 +688,7 @@ Item {
 
             Text {
                 Layout.fillWidth: true
-                visible: !_loginBusy
+                visible: false
                 text: _showServerOverride ? tr("🔼 Masquer") : (tr("Serveur : ") + credsPersist.cloudServer + " " + tr("(modifier)"))
                 font.pixelSize: 10; color: "#999999"
                 horizontalAlignment: Text.AlignHCenter
@@ -610,12 +697,14 @@ Item {
             }
             ColumnLayout {
                 Layout.fillWidth: true; spacing: 8
-                visible: _showServerOverride && !_loginBusy
+                visible: false
                 RowLayout {
                     Layout.fillWidth: true; spacing: 8
                     Button {
                         text: tr("☁️ Officiel")
                         Layout.fillWidth: true
+                        enabled: false
+                        opacity: 0.5
                         background: Rectangle { radius: 8; color: credsPersist.serverMode === "official" ? "#4A6FAE" : "#ddd" }
                         contentItem: Text { text: parent.text; color: credsPersist.serverMode === "official" ? "white" : "#333"; horizontalAlignment: Text.AlignHCenter; font.pixelSize: 11 }
                         onClicked: { credsPersist.serverMode = "official"; credsPersist.cloudServer = normalizeApiUrl(officialServerUrl); }
@@ -623,6 +712,8 @@ Item {
                     Button {
                         text: tr("🏠 Auto-hébergé")
                         Layout.fillWidth: true
+                        enabled: false
+                        opacity: 0.5
                         background: Rectangle { radius: 8; color: credsPersist.serverMode === "selfhosted" ? "#4A6FAE" : "#ddd" }
                         contentItem: Text { text: parent.text; color: credsPersist.serverMode === "selfhosted" ? "white" : "#333"; horizontalAlignment: Text.AlignHCenter; font.pixelSize: 11 }
                         onClicked: { credsPersist.serverMode = "selfhosted"; credsPersist.cloudServer = normalizeApiUrl(credsPersist.selfHostedServerUrl); }
@@ -631,6 +722,7 @@ Item {
                 TextField {
                     Layout.fillWidth: true
                     visible: credsPersist.serverMode === "selfhosted"
+                    enabled: false
                     placeholderText: "https://mon-serveur.exemple.com"
                     text: credsPersist.selfHostedServerUrl
                     font.pixelSize: 12
@@ -653,6 +745,33 @@ Item {
                     contentItem: Text { text: parent.text; horizontalAlignment: Text.AlignHCenter; font.pixelSize: 13 }
                     onClicked: { _pendingContinuation = null; loginDialog.close(); }
                 }
+            }
+        }
+    }
+
+    Dialog {
+        id: syncErrorDialog
+        property string message: ""
+        parent: mainWindow ? mainWindow.contentItem : null
+        anchors.centerIn: parent
+        modal: true
+        closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
+        padding: 24
+        width: mainWindow ? Math.min(mainWindow.width * 0.90, 380) : 300
+        background: Rectangle { radius: 16; color: "#FFFFFF"; border.color: "#B00020"; border.width: 3 }
+        contentItem: ColumnLayout {
+            spacing: 16
+            Label {
+                Layout.fillWidth: true
+                text: syncErrorDialog.message
+                font.pixelSize: 15; font.bold: true; color: "#B00020"; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap
+            }
+            Button {
+                Layout.fillWidth: true
+                text: tr("OK")
+                background: Rectangle { radius: 10; color: "#B00020" }
+                contentItem: Text { text: parent.text; color: "white"; font.bold: true; horizontalAlignment: Text.AlignHCenter; font.pixelSize: 13 }
+                onClicked: syncErrorDialog.close()
             }
         }
     }
