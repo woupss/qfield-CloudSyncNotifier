@@ -4,4 +4,4 @@ description=A popup will show up when there is a waiting cloud synchronization.
 author=woouuppss
 icon=icon.svg
 version=0.1
-homepage=https://github.com/
+homepage=https://github.com/woupss/qfield-CloudSyncNotifier
